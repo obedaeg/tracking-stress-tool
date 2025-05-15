@@ -40,15 +40,21 @@ db_pool = None
 
 # Configuration
 HOSTS = [
-    "http://tracking1.example.com",
-    "http://tracking2.example.com",
-    "http://tracking3.example.com"
+    # "http://tracking1.example.com",
+    # "http://tracking2.example.com",
+    # "http://tracking3.example.com"
+    'http://localhost:8001',
+    'http://localhost:8002',
+    'http://localhost:8003',
 ]
 
 # Endpoints
 IMPRESSION_ENDPOINT = "/api/events/impressions"
 CLICK_ENDPOINT = "/api/events/click"
 CONVERSION_ENDPOINT = "/api/events/conversions"
+
+# Verbose debugging
+DEBUG = True
 
 # Probabilities
 CLICK_PROBABILITY = 0.4  # 40% chance of a click after impression
@@ -417,12 +423,18 @@ def store_event(event_id: str, event_type: str, event_data: Dict[str, Any],
         db_pool.return_connection(conn)
 
 
-def post_to_host(host: str, endpoint: str, data: Dict[str, Any], timeout_ms: int = 500) -> Tuple[bool, str]:
+def post_to_host(host: str, endpoint: str, data: Dict[str, Any], timeout_ms: int = 2000) -> Tuple[bool, str]:
     """
     Post event data to a host endpoint with timeout in milliseconds
     Returns (success, message)
     """
     url = f"{host}{endpoint}"
+    if DEBUG:
+        print(f"Sending request to: {url}")
+        print(f"Headers: Content-Type: application/json")
+        print(f"Timeout: {timeout_ms}ms")
+        print(f"Data: {json.dumps(data, indent=2)[:500]}...")  # Truncate for readability
+    
     try:
         # Convert milliseconds to seconds for requests library
         timeout_sec = timeout_ms / 1000.0
@@ -432,21 +444,40 @@ def post_to_host(host: str, endpoint: str, data: Dict[str, Any], timeout_ms: int
             headers={"Content-Type": "application/json"},
             timeout=timeout_sec
         )
+        
+        if DEBUG:
+            print(f"Response status: {response.status_code}")
+            try:
+                print(f"Response headers: {dict(response.headers)}")
+                resp_text = response.text[:500] + "..." if len(response.text) > 500 else response.text
+                print(f"Response body: {resp_text}")
+            except:
+                print("Could not print response details")
+        
         if response.status_code >= 200 and response.status_code < 300:
             return True, f"Posted to {url}: {response.status_code}"
         else:
-            return False, f"Failed posting to {url}: {response.status_code} - {response.text}"
+            return False, f"Failed posting to {url}: {response.status_code} - {response.text[:200]}"
+    except requests.exceptions.ConnectTimeout:
+        return False, f"Connection timeout posting to {url} (timeout={timeout_ms}ms)"
+    except requests.exceptions.ReadTimeout:
+        return False, f"Read timeout posting to {url} (timeout={timeout_ms}ms)"
+    except requests.exceptions.ConnectionError as e:
+        return False, f"Connection error posting to {url}: {str(e)}"
     except requests.RequestException as e:
         return False, f"Request error posting to {url}: {str(e)}"
+    except Exception as e:
+        return False, f"Unexpected error posting to {url}: {str(e)}"
 
 
-def post_event_to_all_hosts(endpoint: str, data: Dict[str, Any], timeout_ms: int = 500) -> List[Tuple[str, bool, str]]:
+def post_event_to_all_hosts(endpoint: str, data: Dict[str, Any], timeout_ms: int = 2000) -> List[Tuple[str, bool, str]]:
     """
     Post event data to all hosts in parallel with timeout in milliseconds
     Returns list of (host, success, message)
     """
     results = []
-    
+    if DEBUG:
+        print(f"Posting to {len(HOSTS)} host(s) via endpoint: {endpoint}")
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(HOSTS)) as executor:
         future_to_host = {
             executor.submit(post_to_host, host, endpoint, data, timeout_ms): host
@@ -704,8 +735,16 @@ def main():
                         help='Number of impressions to generate in single-threaded mode (default: 10)')
     parser.add_argument('--delay', type=float, default=1.0,
                         help='Delay between impression generations in seconds (default: 1.0)')
-    parser.add_argument('--request-timeout', type=int, default=500,
-                        help='Timeout for HTTP requests in milliseconds (default: 500)')
+    parser.add_argument('--request-timeout', type=int, default=2000,
+                        help='Timeout for HTTP requests in milliseconds (default: 2000)')
+    parser.add_argument('--debug', action='store_true',
+                        help='Enable verbose debug output')
+    parser.add_argument('--impression-endpoint', type=str, default='/api/events/impressions',
+                        help='API endpoint for impressions (default: /api/events/impressions)')
+    parser.add_argument('--click-endpoint', type=str, default='/api/events/click',
+                        help='API endpoint for clicks (default: /api/events/click)')
+    parser.add_argument('--conversion-endpoint', type=str, default='/api/events/conversions',
+                        help='API endpoint for conversions (default: /api/events/conversions)')
     parser.add_argument('--dry-run', action='store_true',
                         help='Do not post events, just print them')
     parser.add_argument('--hosts', type=str,
@@ -738,10 +777,20 @@ def main():
         random.seed(args.seed)
         fake.seed_instance(args.seed)
     
+    # Enable debug mode if specified
+    global DEBUG
+    DEBUG = args.debug
+    
     # Override default hosts if specified
     global HOSTS
     if args.hosts:
         HOSTS = [host.strip() for host in args.hosts.split(',')]
+    
+    # Override endpoints if specified
+    global IMPRESSION_ENDPOINT, CLICK_ENDPOINT, CONVERSION_ENDPOINT
+    IMPRESSION_ENDPOINT = args.impression_endpoint
+    CLICK_ENDPOINT = args.click_endpoint
+    CONVERSION_ENDPOINT = args.conversion_endpoint
     
     # Initialize database if requested
     global db_pool
@@ -782,6 +831,10 @@ def main():
         print(f"Test duration: {args.duration} seconds")
         print(f"Using hosts: {', '.join(HOSTS)}")
         print(f"{'DRY RUN MODE - ' if args.dry_run else ''}Delay: {args.delay}s, Request timeout: {args.request_timeout}ms")
+        print(f"Debug mode: {'Enabled' if DEBUG else 'Disabled'}")
+        print(f"Impression endpoint: {IMPRESSION_ENDPOINT}")
+        print(f"Click endpoint: {CLICK_ENDPOINT}")
+        print(f"Conversion endpoint: {CONVERSION_ENDPOINT}")
         print(f"Click probability: {CLICK_PROBABILITY*100}%")
         print(f"Conversion probability: {CONVERSION_PROBABILITY*100}%")
         print(f"Database storage: {'Enabled' if args.use_database else 'Disabled'}")
@@ -801,6 +854,10 @@ def main():
         print(f"Single-threaded mode generating {args.impressions} impressions")
         print(f"Using hosts: {', '.join(HOSTS)}")
         print(f"{'DRY RUN MODE - ' if args.dry_run else ''}Delay: {args.delay}s, Request timeout: {args.request_timeout}ms")
+        print(f"Debug mode: {'Enabled' if DEBUG else 'Disabled'}")
+        print(f"Impression endpoint: {IMPRESSION_ENDPOINT}")
+        print(f"Click endpoint: {CLICK_ENDPOINT}")
+        print(f"Conversion endpoint: {CONVERSION_ENDPOINT}")
         print(f"Click probability: {CLICK_PROBABILITY*100}%")
         print(f"Conversion probability: {CONVERSION_PROBABILITY*100}%")
         print(f"Database storage: {'Enabled' if args.use_database else 'Disabled'}")
