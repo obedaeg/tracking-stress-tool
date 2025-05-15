@@ -38,14 +38,18 @@ fake = Faker()
 stop_threads = False
 db_pool = None
 
+# HTTP Session management
+http_sessions = {}
+http_sessions_lock = threading.Lock()
+
 # Configuration
 HOSTS = [
     # "http://tracking1.example.com",
     # "http://tracking2.example.com",
     # "http://tracking3.example.com"
-    'http://localhost:8001',
-    'http://localhost:8002',
-    'http://localhost:8003',
+    'http://172.20.10.11:8000',
+    'http://172.20.10.13:5000',
+    'http://172.20.10.2:8000',
 ]
 
 # Endpoints
@@ -423,64 +427,167 @@ def store_event(event_id: str, event_type: str, event_data: Dict[str, Any],
         db_pool.return_connection(conn)
 
 
-def post_to_host(host: str, endpoint: str, data: Dict[str, Any], timeout_ms: int = 2000) -> Tuple[bool, str]:
+def get_http_session(thread_id: int) -> requests.Session:
+    """
+    Get or create a requests Session for the current thread
+    Using a session allows connection pooling and reuse
+    """
+    global http_sessions
+    
+    # Create a thread-specific key
+    key = f"thread-{thread_id}"
+    
+    with http_sessions_lock:
+        if key not in http_sessions:
+            # Create a new session with connection pooling
+            session = requests.Session()
+            
+            # Configure the session with appropriate connection limits
+            adapter = requests.adapters.HTTPAdapter(
+                pool_connections=10,  # Number of connection pools
+                pool_maxsize=10,      # Number of connections per pool
+                max_retries=0,        # We'll handle retries manually
+                pool_block=False      # Don't block if pool is full
+            )
+            
+            # Mount the adapter for both HTTP and HTTPS
+            session.mount('http://', adapter)
+            session.mount('https://', adapter)
+            
+            # Store the session
+            http_sessions[key] = session
+            
+            if DEBUG:
+                print(f"Created new HTTP session for {key}")
+        
+        return http_sessions[key]
+
+
+def post_to_host(host: str, endpoint: str, data: Dict[str, Any], 
+                 timeout_ms: int = 2000, thread_id: int = None,
+                 retry_count: int = 2) -> Tuple[bool, str]:
     """
     Post event data to a host endpoint with timeout in milliseconds
     Returns (success, message)
+    Uses connection pooling for better performance
+    Includes retry logic with exponential backoff
     """
     url = f"{host}{endpoint}"
+    
+    # Get the thread's HTTP session
+    session = get_http_session(thread_id if thread_id is not None else 0)
+    
+    # Convert milliseconds to seconds for requests library
+    timeout_sec = timeout_ms / 1000.0
+    
     if DEBUG:
         print(f"Sending request to: {url}")
         print(f"Headers: Content-Type: application/json")
-        print(f"Timeout: {timeout_ms}ms")
+        print(f"Timeout: {timeout_sec}s")
         print(f"Data: {json.dumps(data, indent=2)[:500]}...")  # Truncate for readability
     
-    try:
-        # Convert milliseconds to seconds for requests library
-        timeout_sec = timeout_ms / 1000.0
-        response = requests.post(
-            url,
-            json=data,
-            headers={"Content-Type": "application/json"},
-            timeout=timeout_sec
-        )
+    # Initialize retry mechanism
+    attempts = 0
+    max_attempts = retry_count + 1  # Initial attempt + retries
+    
+    while attempts < max_attempts:
+        try:
+            attempts += 1
+            
+            # Use the session for connection pooling
+            response = session.post(
+                url,
+                json=data,
+                headers={"Content-Type": "application/json"},
+                timeout=timeout_sec
+            )
+            
+            if DEBUG and attempts > 1:
+                print(f"Retry {attempts-1} succeeded for {url}")
+            
+            if DEBUG:
+                print(f"Response status: {response.status_code}")
+                try:
+                    print(f"Response headers: {dict(response.headers)}")
+                    resp_text = response.text[:500] + "..." if len(response.text) > 500 else response.text
+                    print(f"Response body: {resp_text}")
+                except:
+                    print("Could not print response details")
+            
+            if response.status_code >= 200 and response.status_code < 300:
+                return True, f"Posted to {url}: {response.status_code}"
+            else:
+                # Don't retry 4xx errors (client errors)
+                if response.status_code >= 400 and response.status_code < 500:
+                    return False, f"Failed posting to {url}: {response.status_code} - {response.text[:200]}"
+                    
+                # For 5xx errors, retry if we have attempts left
+                if attempts < max_attempts:
+                    backoff_time = min(0.1 * (2 ** (attempts - 1)), 2.0)  # Exponential backoff, max 2 seconds
+                    if DEBUG:
+                        print(f"Retrying in {backoff_time:.2f}s after server error: {response.status_code}")
+                    time.sleep(backoff_time)
+                    continue
+                else:
+                    return False, f"Failed posting to {url} after {attempts} attempts: {response.status_code}"
         
-        if DEBUG:
-            print(f"Response status: {response.status_code}")
-            try:
-                print(f"Response headers: {dict(response.headers)}")
-                resp_text = response.text[:500] + "..." if len(response.text) > 500 else response.text
-                print(f"Response body: {resp_text}")
-            except:
-                print("Could not print response details")
-        
-        if response.status_code >= 200 and response.status_code < 300:
-            return True, f"Posted to {url}: {response.status_code}"
-        else:
-            return False, f"Failed posting to {url}: {response.status_code} - {response.text[:200]}"
-    except requests.exceptions.ConnectTimeout:
-        return False, f"Connection timeout posting to {url} (timeout={timeout_ms}ms)"
-    except requests.exceptions.ReadTimeout:
-        return False, f"Read timeout posting to {url} (timeout={timeout_ms}ms)"
-    except requests.exceptions.ConnectionError as e:
-        return False, f"Connection error posting to {url}: {str(e)}"
-    except requests.RequestException as e:
-        return False, f"Request error posting to {url}: {str(e)}"
-    except Exception as e:
-        return False, f"Unexpected error posting to {url}: {str(e)}"
+        except (requests.exceptions.ConnectTimeout, requests.exceptions.ReadTimeout) as e:
+            error_type = "Connection timeout" if isinstance(e, requests.exceptions.ConnectTimeout) else "Read timeout"
+            
+            # Retry timeouts with backoff
+            if attempts < max_attempts:
+                backoff_time = min(0.1 * (2 ** (attempts - 1)), 2.0)  # Exponential backoff, max 2 seconds
+                if DEBUG:
+                    print(f"Retrying in {backoff_time:.2f}s after {error_type}")
+                time.sleep(backoff_time)
+                continue
+            else:
+                return False, f"{error_type} posting to {url} after {attempts} attempts (timeout={timeout_ms}ms)"
+                
+        except requests.exceptions.ConnectionError as e:
+            # Connection errors often mean the host is down or unreachable
+            # In high-thread environments, it's best to not retry these immediately
+            if attempts < max_attempts:
+                backoff_time = min(0.2 * (2 ** (attempts - 1)), 5.0)  # Longer backoff for connection errors
+                if DEBUG:
+                    print(f"Retrying in {backoff_time:.2f}s after connection error")
+                time.sleep(backoff_time)
+                continue
+            else:
+                return False, f"Connection error posting to {url} after {attempts} attempts: {str(e)}"
+                
+        except requests.RequestException as e:
+            # Other request exceptions
+            if attempts < max_attempts:
+                backoff_time = min(0.1 * (2 ** (attempts - 1)), 2.0)
+                if DEBUG:
+                    print(f"Retrying in {backoff_time:.2f}s after request exception")
+                time.sleep(backoff_time)
+                continue
+            else:
+                return False, f"Request error posting to {url} after {attempts} attempts: {str(e)}"
+                
+        except Exception as e:
+            # Unexpected errors should probably not be retried
+            return False, f"Unexpected error posting to {url}: {str(e)}"
 
 
-def post_event_to_all_hosts(endpoint: str, data: Dict[str, Any], timeout_ms: int = 2000) -> List[Tuple[str, bool, str]]:
+def post_event_to_all_hosts(endpoint: str, data: Dict[str, Any], 
+                           timeout_ms: int = 2000, 
+                           thread_id: int = None) -> List[Tuple[str, bool, str]]:
     """
     Post event data to all hosts in parallel with timeout in milliseconds
     Returns list of (host, success, message)
+    Uses connection pooling and retry logic
     """
     results = []
     if DEBUG:
         print(f"Posting to {len(HOSTS)} host(s) via endpoint: {endpoint}")
+    
+    # Use a thread pool with size matching the number of hosts
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(HOSTS)) as executor:
         future_to_host = {
-            executor.submit(post_to_host, host, endpoint, data, timeout_ms): host
+            executor.submit(post_to_host, host, endpoint, data, timeout_ms, thread_id): host
             for host in HOSTS
         }
         
@@ -490,7 +597,7 @@ def post_event_to_all_hosts(endpoint: str, data: Dict[str, Any], timeout_ms: int
                 success, message = future.result()
                 results.append((host, success, message))
             except Exception as e:
-                results.append((host, False, f"Exception: {str(e)}"))
+                results.append((host, False, f"Thread pool exception: {str(e)}"))
     
     return results
 
@@ -502,22 +609,33 @@ def generate_and_post_events(
     dry_run: bool = False,
     thread_id: int = None,
     counts_lock: threading.Lock = None,
-    shared_counts: Dict[str, int] = None,
-    use_database: bool = False
-) -> Dict[str, int]:
+    shared_counts: Dict[str, Any] = None,
+    use_database: bool = False,
+    fault_tolerant: bool = True
+) -> Dict[str, Any]:
     """
     Generate and post impressions (and resulting clicks/conversions)
     If num_impressions is None, runs until stop_threads is set to True
     Returns counts of events generated and posted
     """
+    # Initialize local counts for aggregate statistics
     local_counts = {
         "impressions_generated": 0,
         "impressions_posted": 0,
         "clicks_generated": 0,
         "clicks_posted": 0,
         "conversions_generated": 0,
-        "conversions_posted": 0
+        "conversions_posted": 0,
+        "per_host": {}  # Will store per-host statistics
     }
+    
+    # Initialize per-host statistics
+    for host in HOSTS:
+        local_counts["per_host"][host] = {
+            "impressions_posted": 0,
+            "clicks_posted": 0,
+            "conversions_posted": 0
+        }
     
     # For thread identification in logs
     thread_prefix = f"[Thread {thread_id}] " if thread_id is not None else ""
@@ -545,9 +663,19 @@ def generate_and_post_events(
                 store_event(impression["impression_id"], "impression", impression, mock_results)
         else:
             # Post impression to all hosts
-            results = post_event_to_all_hosts(IMPRESSION_ENDPOINT, impression, timeout_ms)
+            results = post_event_to_all_hosts(IMPRESSION_ENDPOINT, impression, timeout_ms, thread_id)
             success_count = sum(1 for _, success, _ in results if success)
             local_counts["impressions_posted"] += success_count
+            
+            # If all posts failed and we're not in fault-tolerant mode, slow down
+            if success_count == 0 and not fault_tolerant:
+                # Add a small delay to prevent overwhelming the system if all hosts are down
+                time.sleep(min(1.0, timeout_ms / 2000))
+            
+            # Record per-host results
+            for host, success, _ in results:
+                if success:
+                    local_counts["per_host"][host]["impressions_posted"] += 1
             
             if thread_id is None:  # Reduce log verbosity in multi-threaded mode
                 for host, success, message in results:
@@ -577,9 +705,18 @@ def generate_and_post_events(
                     store_event(click["click_id"], "click", click, mock_results)
             else:
                 # Post click to all hosts
-                results = post_event_to_all_hosts(CLICK_ENDPOINT, click, timeout_ms)
+                results = post_event_to_all_hosts(CLICK_ENDPOINT, click, timeout_ms, thread_id)
                 success_count = sum(1 for _, success, _ in results if success)
                 local_counts["clicks_posted"] += success_count
+                
+                # If all posts failed and we're not in fault-tolerant mode, slow down
+                if success_count == 0 and not fault_tolerant:
+                    time.sleep(min(1.0, timeout_ms / 2000))
+                
+                # Record per-host results
+                for host, success, _ in results:
+                    if success:
+                        local_counts["per_host"][host]["clicks_posted"] += 1
                 
                 if thread_id is None:  # Reduce log verbosity in multi-threaded mode
                     for host, success, message in results:
@@ -609,9 +746,18 @@ def generate_and_post_events(
                         store_event(conversion["conversion_id"], "conversion", conversion, mock_results)
                 else:
                     # Post conversion to all hosts
-                    results = post_event_to_all_hosts(CONVERSION_ENDPOINT, conversion, timeout_ms)
+                    results = post_event_to_all_hosts(CONVERSION_ENDPOINT, conversion, timeout_ms, thread_id)
                     success_count = sum(1 for _, success, _ in results if success)
                     local_counts["conversions_posted"] += success_count
+                    
+                    # If all posts failed and we're not in fault-tolerant mode, slow down
+                    if success_count == 0 and not fault_tolerant:
+                        time.sleep(min(1.0, timeout_ms / 2000))
+                    
+                    # Record per-host results
+                    for host, success, _ in results:
+                        if success:
+                            local_counts["per_host"][host]["conversions_posted"] += 1
                     
                     if thread_id is None:  # Reduce log verbosity in multi-threaded mode
                         for host, success, message in results:
@@ -629,41 +775,122 @@ def generate_and_post_events(
         if shared_counts is not None and counts_lock is not None:
             with counts_lock:
                 for key in shared_counts:
-                    shared_counts[key] += local_counts[key]
+                    if key == 'per_host':
+                        # Special handling for the nested per_host dictionary
+                        for host in shared_counts[key]:
+                            if host in local_counts.get('per_host', {}):
+                                for metric in shared_counts[key][host]:
+                                    shared_counts[key][host][metric] += local_counts['per_host'][host].get(metric, 0)
+                    elif isinstance(shared_counts[key], dict):
+                        # Handle other dictionary types (in case we add more in the future)
+                        local_dict = local_counts.get(key, {})
+                        if isinstance(local_dict, dict):
+                            for sub_key in local_dict:
+                                if sub_key in shared_counts[key]:
+                                    shared_counts[key][sub_key] += local_dict[sub_key]
+                    else:
+                        # For numeric counters, add the value
+                        shared_counts[key] += local_counts.get(key, 0)
+                
                 # Reset local counts after adding to shared
-                local_counts = {key: 0 for key in local_counts}
+                # Initialize a new dictionary with the same structure but zeroed values
+                local_counts = {
+                    "impressions_generated": 0,
+                    "impressions_posted": 0,
+                    "clicks_generated": 0,
+                    "clicks_posted": 0,
+                    "conversions_generated": 0,
+                    "conversions_posted": 0,
+                    "per_host": {}
+                }
+                
+                # Re-initialize per-host statistics with zero values
+                for host in HOSTS:
+                    local_counts["per_host"][host] = {
+                        "impressions_posted": 0,
+                        "clicks_posted": 0,
+                        "conversions_posted": 0
+                    }
     
     return local_counts
 
 
 def user_thread_func(thread_id: int, delay: float, timeout_ms: int, 
                      dry_run: bool, counts_lock: threading.Lock,
-                     shared_counts: Dict[str, int], use_database: bool = False) -> None:
+                     shared_counts: Dict[str, Any], use_database: bool = False,
+                     fault_tolerant: bool = True) -> None:
     """Function executed by each user thread"""
     print(f"[Thread {thread_id}] Starting user simulation")
     
-    local_counts = generate_and_post_events(
-        num_impressions=None,  # Run indefinitely until stopped
-        delay=delay,
-        timeout_ms=timeout_ms,
-        dry_run=dry_run,
-        thread_id=thread_id,
-        counts_lock=counts_lock,
-        shared_counts=shared_counts,
-        use_database=use_database
-    )
+    # Initialize local_counts before try block to avoid UnboundLocalError
+    local_counts = {
+        "impressions_generated": 0,
+        "impressions_posted": 0,
+        "clicks_generated": 0,
+        "clicks_posted": 0,
+        "conversions_generated": 0,
+        "conversions_posted": 0,
+        "per_host": {}
+    }
     
-    # Add any remaining counts to shared counts
-    with counts_lock:
-        for key in shared_counts:
-            shared_counts[key] += local_counts[key]
+    # Initialize per-host statistics
+    for host in HOSTS:
+        local_counts["per_host"][host] = {
+            "impressions_posted": 0,
+            "clicks_posted": 0,
+            "conversions_posted": 0
+        }
+    
+    try:
+        # Generate and post events
+        local_counts = generate_and_post_events(
+            num_impressions=None,  # Run indefinitely until stopped
+            delay=delay,
+            timeout_ms=timeout_ms,
+            dry_run=dry_run,
+            thread_id=thread_id,
+            counts_lock=counts_lock,
+            shared_counts=shared_counts,
+            use_database=use_database,
+            fault_tolerant=fault_tolerant
+        )
+        
+        # Any code here will be skipped if generate_and_post_events raises an exception
+        
+    except Exception as e:
+        print(f"[Thread {thread_id}] Error in thread: {str(e)}")
+    finally:
+        # Always execute this block, regardless of whether an exception occurred
+        try:
+            # Add any remaining counts to shared counts
+            with counts_lock:
+                for key in shared_counts:
+                    if key == 'per_host':
+                        # Special handling for the nested per_host dictionary
+                        for host in shared_counts[key]:
+                            if host in local_counts.get('per_host', {}):
+                                for metric in shared_counts[key][host]:
+                                    shared_counts[key][host][metric] += local_counts['per_host'][host].get(metric, 0)
+                    elif isinstance(shared_counts[key], dict):
+                        # Handle other dictionary types (in case we add more in the future)
+                        local_dict = local_counts.get(key, {})
+                        if isinstance(local_dict, dict):
+                            for sub_key in local_dict:
+                                if sub_key in shared_counts[key]:
+                                    shared_counts[key][sub_key] += local_dict[sub_key]
+                    else:
+                        # For numeric counters, add the value
+                        shared_counts[key] += local_counts.get(key, 0)
+        except Exception as e:
+            print(f"[Thread {thread_id}] Error updating shared counts: {str(e)}")
     
     print(f"[Thread {thread_id}] User simulation stopped")
 
 
 def run_multi_threaded_test(num_threads: int, duration: int, delay: float, 
                            timeout_ms: int, dry_run: bool, 
-                           use_database: bool = False) -> Dict[str, int]:
+                           use_database: bool = False,
+                           fault_tolerant: bool = True) -> Dict[str, Any]:
     """
     Run a multi-threaded stress test with the specified number of user threads
     for the specified duration
@@ -678,16 +905,31 @@ def run_multi_threaded_test(num_threads: int, duration: int, delay: float,
         "clicks_generated": 0,
         "clicks_posted": 0,
         "conversions_generated": 0,
-        "conversions_posted": 0
+        "conversions_posted": 0,
+        "per_host": {}
     }
+    
+    # Initialize per-host statistics
+    for host in HOSTS:
+        shared_counts["per_host"][host] = {
+            "impressions_posted": 0,
+            "clicks_posted": 0,
+            "conversions_posted": 0
+        }
+    
+    # Create a thread-safe lock for updating shared counts
     counts_lock = threading.Lock()
+    
+    print(f"Starting {num_threads} user threads with {timeout_ms}ms request timeout")
+    print(f"Fault tolerance mode: {'Enabled' if fault_tolerant else 'Disabled'}")
     
     # Create and start user threads
     threads = []
     for i in range(num_threads):
         thread = threading.Thread(
             target=user_thread_func,
-            args=(i+1, delay, timeout_ms, dry_run, counts_lock, shared_counts, use_database)
+            args=(i+1, delay, timeout_ms, dry_run, counts_lock, 
+                  shared_counts, use_database, fault_tolerant)
         )
         thread.daemon = True  # Thread will exit when main program exits
         threads.append(thread)
@@ -703,7 +945,13 @@ def run_multi_threaded_test(num_threads: int, duration: int, delay: float,
             
             # Make a copy of the current counts to avoid lock contention
             with counts_lock:
-                current_counts = shared_counts.copy()
+                # Create a safe deep copy for reporting progress
+                current_counts = {}
+                for key, value in shared_counts.items():
+                    if isinstance(value, dict):
+                        current_counts[key] = value.copy()  # shallow copy is enough for our metrics
+                    else:
+                        current_counts[key] = value
             
             print(f"\nTest progress: {elapsed:.1f}s elapsed, {remaining:.1f}s remaining")
             print(f"Impressions: {current_counts['impressions_generated']}, " +
@@ -737,6 +985,8 @@ def main():
                         help='Delay between impression generations in seconds (default: 1.0)')
     parser.add_argument('--request-timeout', type=int, default=2000,
                         help='Timeout for HTTP requests in milliseconds (default: 2000)')
+    parser.add_argument('--fault-tolerant', action='store_true',
+                        help='Continue at full speed even when hosts are unreachable')
     parser.add_argument('--debug', action='store_true',
                         help='Enable verbose debug output')
     parser.add_argument('--impression-endpoint', type=str, default='/api/events/impressions',
@@ -847,7 +1097,8 @@ def main():
             delay=args.delay,
             timeout_ms=args.request_timeout,
             dry_run=args.dry_run,
-            use_database=args.use_database
+            use_database=args.use_database,
+            fault_tolerant=args.fault_tolerant
         )
         end_time = time.time()
     else:
@@ -895,11 +1146,55 @@ def main():
     print(f"Impressions per second: {counts['impressions_generated']/duration:.2f}")
     print(f"Clicks per second: {counts['clicks_generated']/duration:.2f}")
     print(f"Conversions per second: {counts['conversions_generated']/duration:.2f}")
+    
+    # Report per-host statistics
+    print(f"\nPer-Host Statistics:")
+    print(f"===================")
+    
+    # Calculate the maximum host name length for alignment
+    max_host_length = max(len(host) for host in HOSTS)
+    
+    # Header row
+    print(f"{'Host':{max_host_length}} | {'Impressions':12} | {'Clicks':12} | {'Conversions':12} | {'Success Rate':12}")
+    print(f"{'-'*max_host_length} | {'-'*12} | {'-'*12} | {'-'*12} | {'-'*12}")
+    
+    # Data rows for each host
+    for host in HOSTS:
+        host_stats = counts['per_host'].get(host, {
+            "impressions_posted": 0, 
+            "clicks_posted": 0, 
+            "conversions_posted": 0
+        })
+        
+        # Calculate total events for this host
+        total_expected = counts['impressions_generated'] + counts['clicks_generated'] + counts['conversions_generated']
+        total_actual = (host_stats.get('impressions_posted', 0) + 
+                       host_stats.get('clicks_posted', 0) + 
+                       host_stats.get('conversions_posted', 0))
+        
+        # Calculate success rate for this host
+        success_rate = (total_actual / max(1, total_expected)) * 100
+        
+        print(f"{host:{max_host_length}} | "
+              f"{host_stats.get('impressions_posted', 0):12} | "
+              f"{host_stats.get('clicks_posted', 0):12} | "
+              f"{host_stats.get('conversions_posted', 0):12} | "
+              f"{success_rate:10.1f}%")
 
 
-    # Clean up database connections
+    # Clean up resources
     if args.use_database and db_pool:
         db_pool.close()
+    
+    # Close all HTTP sessions
+    with http_sessions_lock:
+        for key, session in http_sessions.items():
+            try:
+                session.close()
+                if DEBUG:
+                    print(f"Closed HTTP session for {key}")
+            except:
+                pass
 
 
 if __name__ == "__main__":
